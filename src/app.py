@@ -36,18 +36,22 @@ def initialize_nltk():
     Optimize NLTK usage by downloading resources only once
     and returning necessary objects to avoid re-initialization.
     """
-    resources = ['punkt', 'stopwords', 'wordnet', 'omw-1.4']
-    for resource in resources:
+    # Define resources and their specific lookup paths to prevent false negatives
+    # Format: (resource_name, lookup_path)
+    resources = [
+        ('punkt', 'tokenizers/punkt'),
+        ('punkt_tab', 'tokenizers/punkt_tab'),
+        ('stopwords', 'corpora/stopwords'),
+        ('wordnet', 'corpora/wordnet'),
+        ('omw-1.4', 'corpora/omw-1.4')
+    ]
+    
+    for resource, path in resources:
         try:
-            if resource == 'punkt':
-                nltk.data.find('tokenizers/punkt')
-            elif resource == 'stopwords':
-                nltk.data.find('corpora/stopwords')
-            elif resource == 'wordnet':
-                nltk.data.find('corpora/wordnet')
-            else:
-                nltk.data.find(f'corpora/{resource}')
+            # Check if the resource already exists
+            nltk.data.find(path)
         except LookupError:
+            # If not found, download it silently
             nltk.download(resource, quiet=True)
     
     from nltk.corpus import stopwords
