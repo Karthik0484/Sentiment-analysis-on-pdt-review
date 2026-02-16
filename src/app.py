@@ -24,6 +24,10 @@ from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
 from reportlab.pdfgen import canvas
 
+import speech_recognition as sr
+from pydub import AudioSegment
+import static_ffmpeg
+
 # ============================================================================
 # PERFORMANCE OPTIMIZATION: 1. SETUP & CONFIGURATION
 # ============================================================================
@@ -32,6 +36,12 @@ st.set_page_config(
     page_icon="🤖",
     layout="centered"
 )
+
+# Initialize static-ffmpeg to allow MP3 processing without manual OS install
+try:
+    static_ffmpeg.add_paths()
+except Exception:
+    pass
 
 # ============================================================================
 # PERFORMANCE OPTIMIZATION: 2. CACHED RESOURCE LOADING
@@ -215,6 +225,244 @@ def generate_pdf_report(df, product_name, counts, pie_fig, bar_fig):
     buffer.close()
     return pdf_val
 
+# ============================================================================
+# AUDIO PROCESSING LOGIC
+# ============================================================================
+
+# ============================================================================
+# PRODUCTION-READY AUDIO PROCESSING (CHUNKED & NORMALIZED)
+# ============================================================================
+
+def normalize_audio(audio_file):
+    """
+    Normalize audio to Mono, 16000Hz, 16-bit PCM WAV for better OCR.
+    Requirement: Part 1
+    """
+    try:
+        audio_file.seek(0)
+        audio = AudioSegment.from_file(audio_file)
+        
+        # 1. Convert to Mono
+        audio = audio.set_channels(1)
+        # 2. Convert frame rate to 16000 Hz
+        audio = audio.set_frame_rate(16000)
+        # 3. Ensure 16-bit (2 bytes) PCM
+        audio = audio.set_sample_width(2)
+        
+        # In-memory export
+        normalized_io = io.BytesIO()
+        audio.export(normalized_io, format="wav")
+        normalized_io.seek(0)
+        return normalized_io
+    except Exception as e:
+        st.error(f"Normalization failed: {str(e)}")
+        return None
+
+def split_audio_into_chunks(audio_file, chunk_length_ms=15000):
+    """
+    Split audio into 15-second chunks in-memory.
+    Requirement: Part 3
+    """
+    try:
+        audio_file.seek(0)
+        audio = AudioSegment.from_file(audio_file)
+        
+        chunks = []
+        for i in range(0, len(audio), chunk_length_ms):
+            chunk = audio[i:i + chunk_length_ms]
+            chunks.append(chunk)
+        
+        return chunks
+    except Exception as e:
+        st.error(f"Chunking failed: {str(e)}")
+        return []
+
+def transcribe_chunks(chunks):
+    """
+    Transcribe audio chunks with recognizer tuning and error handling.
+    Requirement: Part 2 & 3
+    """
+    recognizer = sr.Recognizer()
+    # Part 2: Recognizer Tuning
+    recognizer.dynamic_energy_threshold = True
+    recognizer.energy_threshold = 300 
+    
+    full_transcript = []
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for idx, chunk in enumerate(chunks):
+        status_text.text(f"Processing part {idx+1} of {len(chunks)}...")
+        
+        # Convert chunk to WAV in-memory
+        chunk_buffer = io.BytesIO()
+        chunk.export(chunk_buffer, format="wav")
+        chunk_buffer.seek(0)
+        
+        try:
+            with sr.AudioFile(chunk_buffer) as source:
+                # Part 2: Ambient Noise Adjustment
+                recognizer.adjust_for_ambient_noise(source, duration=0.4)
+                # Part 2: Use record() for chunks
+                audio_data = recognizer.record(source)
+                
+                text = recognizer.recognize_google(audio_data)
+                if text:
+                    # Part 6: Cleanup - Basic cleaning during merge
+                    text = text.strip()
+                    full_transcript.append(text)
+        except sr.UnknownValueError:
+            continue
+        except sr.RequestError:
+            st.error("API Limit reached or Internet lost.")
+            break
+        except Exception:
+            continue
+        
+        progress_bar.progress((idx + 1) / len(chunks))
+    
+    status_text.empty()
+    progress_bar.empty()
+    
+    combined = " ".join(full_transcript)
+    
+    # Part 6: Transcript Cleanup
+    # Remove extra spaces and normalize
+    combined = re.sub(r'\s+', ' ', combined).strip()
+    
+    return combined
+
+def audio_to_text(audio_file):
+    """
+    Orchestrator for improved audio recognition.
+    Requirement: Fixed long-audio truncation & Improved accuracy.
+    """
+    # Part 1: Normalization
+    with st.spinner("🎧 Normalizing audio (16kHz, Mono)..."):
+        normalized_audio_io = normalize_audio(audio_file)
+    
+    if not normalized_audio_io:
+        return "ERROR: Normalization failed."
+    
+    # Part 3: Chunking (15s)
+    with st.spinner("✂️ Chunking audio (15s)..."):
+        chunks = split_audio_into_chunks(normalized_audio_io)
+    
+    if not chunks:
+        return "ERROR: Could not split audio."
+    
+    # Part 3: Transcribing
+    with st.spinner("🎙️ Transcribing with tuned recognizer..."):
+        transcript = transcribe_chunks(chunks)
+        
+    if not transcript:
+        return "ERROR: No text detected."
+        
+    return transcript
+
+# ============================================================================
+# SEGMENTATION & BATCH ANALYSIS LOGIC
+# ============================================================================
+
+def split_reviews(transcript):
+    """
+    Regex-based segmentation for robust splitting.
+    Requirement: Part 4
+    """
+    if not transcript or not transcript.strip():
+        return []
+    
+    # Convert to lowercase
+    transcript_lower = transcript.lower()
+    
+    # Use regex splitting for 'next review' (Part 4)
+    # This handles various spacing and ensures robust matching
+    segments = re.split(r"next review", transcript_lower)
+    
+    cleaned_segments = []
+    for seg in segments:
+        # Part 6: Cleanup whitespace and punctuation
+        seg = seg.strip()
+        seg = re.sub(r'^[^\w\s]+|[^\w\s]+$', '', seg)
+        if seg:
+            cleaned_segments.append(seg)
+            
+    # Fallback (Part 4): If no splits occurred, return entire transcript
+    return cleaned_segments if cleaned_segments else [transcript.strip()]
+
+def analyze_reviews_batch(segments, vectorizer, model):
+    """
+    Analyze a list of review segments in batch for efficiency.
+    Requirement 4 & 7
+    """
+    if not segments:
+        return []
+    
+    # 1. Preprocess each segment using existing logic
+    processed_segments = [preprocess_text(seg) for seg in segments]
+    
+    # 2. Transform using existing TF-IDF vectorizer (Requirement 7 - Avoid loops)
+    features = vectorizer.transform(processed_segments)
+    
+    # 3. Predict sentiment using existing model
+    predictions = model.predict(features)
+    
+    # 4. Compute confidence score using predict_proba() (Requirement 4)
+    probabilities = model.predict_proba(features)
+    
+    results = []
+    for i, seg in enumerate(segments):
+        pred_label = predictions[i]
+        prob_dist = probabilities[i]
+        
+        # Find index of predicted label to get confidence
+        pred_idx = np.where(model.classes_ == pred_label)[0][0]
+        confidence = prob_dist[pred_idx]
+        
+        results.append({
+            'text': seg,
+            'sentiment': pred_label,
+            'confidence': confidence
+        })
+        
+    return results
+
+def display_sentiment_summary(df_results, title="Analysis Summary"):
+    """
+    Shared visualization component for summarizing multiple predictions.
+    Requirement 6 & 9
+    """
+    counts = df_results['sentiment'].value_counts()
+    for cat in ['positive', 'neutral', 'negative']:
+        if cat not in counts: counts[cat] = 0
+            
+    st.markdown(f"### {title}")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("😊 Positive", counts['positive'])
+    m2.metric("😐 Neutral", counts['neutral'])
+    m3.metric("😔 Negative", counts['negative'])
+    
+    # Visualizations
+    dist_data = counts.reindex(['positive', 'neutral', 'negative']).fillna(0)
+    col_v1, col_v2 = st.columns(2)
+    
+    with col_v1:
+        fig_pie, ax_pie = plt.subplots(figsize=(6, 6))
+        ax_pie.pie(dist_data, labels=[c.capitalize() for c in dist_data.index], autopct='%1.1f%%', startangle=140, colors=['#28a745', '#ffc107', '#dc3545'])
+        ax_pie.set_title("Sentiment Proportions")
+        st.pyplot(fig_pie)
+        
+    with col_v2:
+        fig_bar, ax_bar = plt.subplots(figsize=(6, 6))
+        dist_data.plot(kind='bar', color=['#28a745', '#ffc107', '#dc3545'], ax=ax_bar)
+        ax_bar.set_title("Sentiment Comparison")
+        ax_bar.set_ylabel("Review Count")
+        ax_bar.set_xticklabels([c.capitalize() for c in dist_data.index], rotation=0)
+        st.pyplot(fig_bar)
+    
+    return fig_pie, fig_bar, counts
+
 @st.cache_resource(show_spinner=False)
 def initialize_nltk():
     """
@@ -240,6 +488,11 @@ def initialize_nltk():
     from nltk.stem import WordNetLemmatizer
     
     stop_words = set(stopwords.words('english'))
+    # REQUIREMENT: Negation Handling Improvement (Part 5)
+    # Ensure these words are NOT removed as they are critical for sentiment
+    negations = {'not', 'no', 'never', 'neither', 'nor', 'none', "n't"}
+    stop_words = stop_words - negations
+    
     lemmatizer = WordNetLemmatizer()
     
     return word_tokenize, stop_words, lemmatizer
@@ -350,73 +603,180 @@ st.markdown("---")
 if analysis_mode == "Single Review":
     review_type = st.radio(
         "Review Format",
-        options=["Text Review", "Audio (Coming Soon)", "Video (Coming Soon)"],
+        options=["Text Review", "Audio Review", "Video (Coming Soon)"],
         index=0,
         horizontal=True
     )
 
-    if review_type != "Text Review":
-        st.info("⚠️ Feature under development. Defaulting to Text mode.")
+    review_text = ""
+    audio_processed_text = None
 
-    review_text = st.text_area(
-        "Review Content",
-        height=150,
-        placeholder="Type your detailed product review here..."
-    )
+    if review_type == "Audio Review":
+        st.info("🎙️ **Instruction:** If your audio contains multiple reviews, please say **'NEXT REVIEW'** clearly between each review.")
+        uploaded_audio = st.file_uploader("Upload Audio File", type=["wav", "mp3"], help="Upload a clear .wav or .mp3 file.")
+        
+        if uploaded_audio:
+            st.audio(uploaded_audio)
+            
+            if st.button("🎤 Transcribe & Analyze", type="primary", use_container_width=True):
+                # Full orchestrator call (includes chunking and transcription)
+                audio_processed_text = audio_to_text(uploaded_audio)
+                
+                if audio_processed_text.startswith("ERROR:"):
+                    st.error(audio_processed_text)
+                    audio_processed_text = None
+                else:
+                    st.success("✅ Transcription Complete!")
+                    with st.expander("📝 View Full Transcript"):
+                        st.write(audio_processed_text)
+                    review_text = audio_processed_text
 
-    analyze_btn = st.button("🔍 Analyze Sentiment", type="primary", use_container_width=True)
+    elif review_type == "Text Review":
+        review_text = st.text_area(
+            "Review Content",
+            height=150,
+            placeholder="Type your detailed product review here..."
+        )
+    else:
+        st.info("🔜 This feature is currently in development. Please use Text or Audio mode.")
+        review_text = ""
+
+    # Use a flag for prediction to avoid duplicating prediction logic
+    analyze_btn = False
+    if review_type == "Text Review":
+        analyze_btn = st.button("🔍 Analyze Sentiment", type="primary", use_container_width=True)
+    elif review_type == "Audio Review" and audio_processed_text:
+        # If successfully transcribed, we auto-trigger analysis or use the button state
+        analyze_btn = True
 
     if analyze_btn:
-        if not review_text.strip():
-            st.warning("⚠️ Please provide some review text.")
+        if not review_text or not review_text.strip():
+            if review_type == "Text Review":
+                st.warning("⚠️ Please provide some review text.")
+            # If Audio and buttons were pressed but transcript was empty, already handled in audio_to_text
         else:
-            with st.spinner("Analyzing..."):
-                processed_text = preprocess_text(review_text)
-                features = vectorizer.transform([processed_text])
-                probabilities = model.predict_proba(features)[0]
-                
-                prediction_idx = np.argmax(probabilities)
-                prediction_label = model.classes_[prediction_idx]
-                confidence = probabilities[prediction_idx] * 100
-                
-                sentiment_map = {
-                    'positive': {'color': 'green', 'emoji': '😃'},
-                    'neutral': {'color': 'orange', 'emoji': '😐'},
-                    'negative': {'color': 'red', 'emoji': '😔'}
-                }
-                
-                result = sentiment_map.get(prediction_label, {'color': 'gray', 'emoji': '❓'})
-                
-                # Display Results
-                st.markdown(f"### Results for: {product_name if product_name else 'Unnamed Product'}")
-                
-                st.markdown(
-                    f"""
-                    <div style="background-color: #f0f2f6; padding: 20px; border-radius: 10px; border-left: 5px solid {result['color']}; text-align: center;">
-                        <h2 style="color: {result['color']}; margin:0;">{result['emoji']} {prediction_label.capitalize()}</h2>
-                        <p style="margin:5px; font-size: 18px;">Confidence: <strong>{confidence:.2f}%</strong></p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-                
-                if rating > 0:
-                    is_match = (
-                        (rating >= 4 and prediction_label == 'positive') or 
-                        (rating == 3 and prediction_label == 'neutral') or 
-                        (rating <= 2 and prediction_label == 'negative')
-                    )
-                    if is_match:
-                        st.success("✅ Prediction alignment: Matches user star rating!")
+            with st.spinner("🧠 Analyzing segmented reviews..."):
+                if review_type == "Audio Review":
+                    # KEY FEATURE: Segmentation Logic (Requirement 1-9)
+                    segments = split_reviews(review_text)
+                    
+                    if not segments:
+                        st.error("❌ Transcript is empty. Could not detect any reviews.")
                     else:
-                        st.info("ℹ️ Note: Detected sentiment differs from star rating.")
+                        st.info(f"📋 Detected {len(segments)} review(s) in audio.")
+                        
+                        # Batch Analyze (Requirement 7)
+                        results = analyze_reviews_batch(segments, vectorizer, model)
+                        
+                        # Display Individual Results (Requirement 5)
+                        for i, res in enumerate(results):
+                            sentiment_map = {
+                                'positive': {'color': 'green', 'emoji': '😃'},
+                                'neutral': {'color': 'orange', 'emoji': '😐'},
+                                'negative': {'color': 'red', 'emoji': '😔'}
+                            }
+                            result_style = sentiment_map.get(res['sentiment'], {'color': 'gray', 'emoji': '❓'})
+                            
+                            with st.expander(f"Review {i+1}: {res['sentiment'].capitalize()}", expanded=(len(segments) == 1)):
+                                st.markdown(f"**Text:** {res['text']}")
+                                st.markdown(
+                                    f"""
+                                    <div style="padding: 10px; border-radius: 5px; border-left: 5px solid {result_style['color']}; background-color: #f9f9f9;">
+                                        <strong>Sentiment:</strong> {result_style['emoji']} {res['sentiment'].capitalize()} <br>
+                                        <strong>Confidence:</strong> {res['confidence']*100:.2f}%
+                                    </div>
+                                    """,
+                                    unsafe_allow_html=True
+                                )
+                        
+                        # Display Summary if more than 1 review or always for consistency (Requirement 6 & 9)
+                        if len(results) >= 1:
+                            st.markdown("---")
+                            df_results = pd.DataFrame(results)
+                            
+                            # Use helper for charts and counts
+                            fig_pie, fig_bar, counts = display_sentiment_summary(df_results, title="Audio Review Analytics")
+                            
+                            # Table & Export (Consistency with Bulk mode - Requirement 9)
+                            st.markdown("---")
+                            st.subheader("📝 Segmented Data Table")
+                            # Format for display
+                            df_display = df_results[['text', 'sentiment', 'confidence']].copy()
+                            df_display['confidence'] = df_display['confidence'].apply(lambda x: f"{x*100:.2f}%")
+                            st.dataframe(df_display, use_container_width=True)
+                            
+                            # Export Buttons
+                            c1, c2 = st.columns(2)
+                            
+                            with c1:
+                                csv_export = df_results[['text', 'sentiment']].to_csv(index=False).encode('utf-8')
+                                st.download_button("📥 Download Results (CSV)", csv_export, "audio_results.csv", "text/csv", key="audio_csv", use_container_width=True)
+                            
+                            with c2:
+                                with st.spinner("Generating PDF Report..."):
+                                    # Alignment with existing PDF logic: rename columns for report
+                                    df_for_report = df_results.copy()
+                                    df_for_report.rename(columns={'text': 'review_text', 'sentiment': 'predicted_sentiment'}, inplace=True)
+                                    
+                                    pdf_data = generate_pdf_report(df_for_report, product_name if product_name else "Audio Review", counts, fig_pie, fig_bar)
+                                    
+                                    st.download_button(
+                                        label="📄 Download Full Report (PDF)",
+                                        data=bytes(pdf_data),
+                                        file_name=f"audio_sentiment_report.pdf",
+                                        mime="application/pdf",
+                                        key="audio_pdf",
+                                        use_container_width=True
+                                    )
+                
+                else:
+                    # Original Single Text Review Logic
+                    processed_text = preprocess_text(review_text)
+                    features = vectorizer.transform([processed_text])
+                    probabilities = model.predict_proba(features)[0]
+                    
+                    prediction_idx = np.argmax(probabilities)
+                    prediction_label = model.classes_[prediction_idx]
+                    confidence = probabilities[prediction_idx] * 100
+                    
+                    sentiment_map = {
+                        'positive': {'color': 'green', 'emoji': '😃'},
+                        'neutral': {'color': 'orange', 'emoji': '😐'},
+                        'negative': {'color': 'red', 'emoji': '😔'}
+                    }
+                    
+                    result = sentiment_map.get(prediction_label, {'color': 'gray', 'emoji': '❓'})
+                    
+                    # Display Results
+                    st.markdown(f"### Results for: {product_name if product_name else 'Unnamed Product'}")
+                    
+                    st.markdown(
+                        f"""
+                        <div style="background-color: #f0f2f6; padding: 20px; border-radius: 10px; border-left: 5px solid {result['color']}; text-align: center;">
+                            <h2 style="color: {result['color']}; margin:0;">{result['emoji']} {prediction_label.capitalize()}</h2>
+                            <p style="margin:5px; font-size: 18px;">Confidence: <strong>{confidence:.2f}%</strong></p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+                    
+                    if rating > 0:
+                        is_match = (
+                            (rating >= 4 and prediction_label == 'positive') or 
+                            (rating == 3 and prediction_label == 'neutral') or 
+                            (rating <= 2 and prediction_label == 'negative')
+                        )
+                        if is_match:
+                            st.success("✅ Prediction alignment: Matches user star rating!")
+                        else:
+                            st.info("ℹ️ Note: Detected sentiment differs from star rating.")
 
-                with st.expander("📊 Probability Breakdown"):
-                    probs_df = pd.DataFrame({
-                        'Sentiment': [c.capitalize() for c in model.classes_],
-                        'Probability': probabilities
-                    })
-                    st.bar_chart(probs_df.set_index('Sentiment'))
+                    with st.expander("📊 Probability Breakdown"):
+                        probs_df = pd.DataFrame({
+                            'Sentiment': [c.capitalize() for c in model.classes_],
+                            'Probability': probabilities
+                        })
+                        st.bar_chart(probs_df.set_index('Sentiment'))
 
 # ============================================================================
 # BULK REVIEW MODE
@@ -454,42 +814,19 @@ else:
                         
                         # 3. Vectorized Prediction (Single batch call)
                         predictions = model.predict(features)
-                        df_bulk['predicted_sentiment'] = predictions
+                        df_bulk['sentiment'] = predictions  # Renamed for consistency with helper
+                        df_bulk['predicted_sentiment'] = predictions # Keep original for compatibility if needed below
                         
                     duration = time.time() - start_time
                     st.success(f"⚡ Extraction & Analysis completed in {duration:.2f} seconds!")
                     
-                    # Dashboard Summary
+                    # Dashboard Summary (Using helper for consistency - Requirement 9)
                     if product_name:
-                        st.subheader(f"📊 Summary for: {product_name}")
+                        summary_title = f"Summary for: {product_name}"
+                    else:
+                        summary_title = "Bulk Analysis Summary"
                     
-                    counts = df_bulk['predicted_sentiment'].value_counts()
-                    for cat in ['positive', 'neutral', 'negative']:
-                        if cat not in counts: counts[cat] = 0
-                        
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("😊 Positive", counts['positive'])
-                    m2.metric("😐 Neutral", counts['neutral'])
-                    m3.metric("😔 Negative", counts['negative'])
-                    
-                    # Visualizations
-                    dist_data = counts.reindex(['positive', 'neutral', 'negative']).fillna(0)
-                    col_v1, col_v2 = st.columns(2)
-                    
-                    with col_v1:
-                        fig_pie, ax_pie = plt.subplots(figsize=(6, 6))
-                        ax_pie.pie(dist_data, labels=[c.capitalize() for c in dist_data.index], autopct='%1.1f%%', startangle=140, colors=['#28a745', '#ffc107', '#dc3545'])
-                        ax_pie.set_title("Sentiment Proportions")
-                        st.pyplot(fig_pie)
-                        
-                    with col_v2:
-                        # For PDF, we need a Matplotlib bar chart too
-                        fig_bar, ax_bar = plt.subplots(figsize=(6, 6))
-                        dist_data.plot(kind='bar', color=['#28a745', '#ffc107', '#dc3545'], ax=ax_bar)
-                        ax_bar.set_title("Sentiment Comparison")
-                        ax_bar.set_ylabel("Review Count")
-                        ax_bar.set_xticklabels([c.capitalize() for c in dist_data.index], rotation=0)
-                        st.pyplot(fig_bar)
+                    fig_pie, fig_bar, counts = display_sentiment_summary(df_bulk, title=summary_title)
                     
                     # Table & Export
                     st.markdown("---")
